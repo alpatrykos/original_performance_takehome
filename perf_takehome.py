@@ -352,7 +352,7 @@ class KernelBuilder:
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
-        n_bufs = 4
+        n_bufs = 16
         tmp_addr_vec = []
         tmp_addr2_vec = []
         for bi in range(n_bufs):
@@ -362,35 +362,29 @@ class KernelBuilder:
         # Vector scratch registers (multi-buffered to increase ILP)
         v_idx = []
         v_val = []
-        v_node_val = []
         v_tmp1 = []
         v_tmp2 = []
-        v_tmp3 = []
         v_addr = []
-        v_cond = []
         for bi in range(n_bufs):
             v_idx.append(self.alloc_scratch(f"v_idx_{bi}", VLEN))
             v_val.append(self.alloc_scratch(f"v_val_{bi}", VLEN))
-            v_node_val.append(self.alloc_scratch(f"v_node_val_{bi}", VLEN))
             v_tmp1.append(self.alloc_scratch(f"v_tmp1_{bi}", VLEN))
             v_tmp2.append(self.alloc_scratch(f"v_tmp2_{bi}", VLEN))
-            v_tmp3.append(self.alloc_scratch(f"v_tmp3_{bi}", VLEN))
             v_addr.append(self.alloc_scratch(f"v_addr_{bi}", VLEN))
-            v_cond.append(self.alloc_scratch(f"v_cond_{bi}", VLEN))
+        parity_depth = 2
+        v_parity = []
+        for bi in range(n_bufs):
+            regs = []
+            for pi in range(parity_depth):
+                regs.append(self.alloc_scratch(f"v_parity_{bi}_{pi}", VLEN))
+            v_parity.append(regs)
 
         # Vector constants
-        v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+        v_p_limit = self.alloc_scratch("v_p_limit", VLEN)
         v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
 
-        body.append(
-            (
-                "valu",
-                ("vbroadcast", v_zero, zero_const),
-            )
-        )
         body.append(
             (
                 "valu",
@@ -406,7 +400,11 @@ class KernelBuilder:
         body.append(
             (
                 "valu",
-                ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+                (
+                    "vbroadcast",
+                    v_p_limit,
+                    self.scratch_const(n_nodes + 1),
+                ),
             )
         )
         body.append(
@@ -434,99 +432,259 @@ class KernelBuilder:
                         ("valu", ("vbroadcast", v_const, self.scratch_const(mul)))
                     )
 
+        # Preload shallow tree nodes for lookup (indices start at root).
+        lookup_max_depth = min(2, forest_height)
+        node_tables = {}
+        for depth in range(lookup_max_depth + 1):
+            base = (1 << depth) - 1
+            nodes = []
+            for offset in range(1 << depth):
+                node_index = base + offset
+                v_node = self.alloc_scratch(f"v_node_d{depth}_{offset}", VLEN)
+                idx_const = self.scratch_const(node_index)
+                body.append(
+                    ("alu", ("+", tmp_addr, self.scratch["forest_values_p"], idx_const))
+                )
+                body.append(("load", ("load", tmp1, tmp_addr)))
+                body.append(("valu", ("vbroadcast", v_node, tmp1)))
+                nodes.append(v_node)
+            node_tables[depth] = nodes
+
         vec_batch = batch_size - (batch_size % VLEN)
-        for round in range(rounds):
-            for i in range(0, vec_batch, VLEN):
-                bi = (i // VLEN) % n_bufs
+        depth_cycle = forest_height + 1
+        group_size = VLEN * n_bufs
+        full_groups = vec_batch // group_size
+        rem_chunks = (vec_batch % group_size) // VLEN
+
+        def emit_group(group_start: int, active_bufs: int):
+            parity_slots = [0] * active_bufs
+            for bi in range(active_bufs):
+                i = group_start + bi * VLEN
                 v_idx_b = v_idx[bi]
                 v_val_b = v_val[bi]
-                v_node_val_b = v_node_val[bi]
-                v_tmp1_b = v_tmp1[bi]
-                v_tmp2_b = v_tmp2[bi]
-                v_tmp3_b = v_tmp3[bi]
-                v_addr_b = v_addr[bi]
-                v_cond_b = v_cond[bi]
                 addr_idx_b = tmp_addr_vec[bi]
                 addr_val_b = tmp_addr2_vec[bi]
                 i_const = self.scratch_const(i)
-                # Compute base addresses for vector loads/stores.
                 body.append(
-                    (
-                        "alu",
-                        ("+", addr_idx_b, self.scratch["inp_indices_p"], i_const),
-                    )
+                    ("alu", ("+", addr_idx_b, self.scratch["inp_indices_p"], i_const))
                 )
                 body.append(
-                    (
-                        "alu",
-                        ("+", addr_val_b, self.scratch["inp_values_p"], i_const),
-                    )
+                    ("alu", ("+", addr_val_b, self.scratch["inp_values_p"], i_const))
                 )
-                body.append(
-                    (
-                        "load",
-                        ("vload", v_idx_b, addr_idx_b),
-                    )
-                )
-                body.append(
-                    (
-                        "load",
-                        ("vload", v_val_b, addr_val_b),
-                    )
-                )
-                # v_addr = forest_values_p + v_idx
-                body.append(("valu", ("+", v_addr_b, v_idx_b, v_forest_p)))
-                # Gather node values using per-lane loads.
-                for lane in range(VLEN):
-                    body.append(("load", ("load_offset", v_node_val_b, v_addr_b, lane)))
-                # v_val ^= v_node_val
-                body.append(("valu", ("^", v_val_b, v_val_b, v_node_val_b)))
+                body.append(("load", ("vload", v_idx_b, addr_idx_b)))
+                body.append(("load", ("vload", v_val_b, addr_val_b)))
+                # p = idx + 1
+                body.append(("valu", ("+", v_idx_b, v_idx_b, v_one)))
 
-                # Hash stages (vectorized)
-                for op1, val1, op2, op3, val3 in HASH_STAGES:
-                    if op1 == "+" and op2 == "+" and op3 == "<<":
-                        mul = 1 + (1 << val3)
+            for round in range(rounds):
+                depth = round % depth_cycle
+                use_lookup = depth <= lookup_max_depth
+                need_wrap = depth == forest_height
+                for bi in range(active_bufs):
+                    v_idx_b = v_idx[bi]
+                    v_val_b = v_val[bi]
+                    v_tmp1_b = v_tmp1[bi]
+                    v_tmp2_b = v_tmp2[bi]
+                    v_addr_b = v_addr[bi]
+                    parity_regs = v_parity[bi]
+                    parity_slot = parity_slots[bi]
+
+                    if use_lookup:
+                        if depth == 0:
+                            node_val_src = node_tables[0][0]
+                        elif depth == 1:
+                            b0 = parity_regs[(parity_slot - 1) % parity_depth]
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_tmp1_b,
+                                        b0,
+                                        node_tables[1][1],
+                                        node_tables[1][0],
+                                    ),
+                                )
+                            )
+                            node_val_src = v_tmp1_b
+                        elif depth == 2:
+                            b0 = parity_regs[(parity_slot - 2) % parity_depth]
+                            b1 = parity_regs[(parity_slot - 1) % parity_depth]
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_tmp1_b,
+                                        b1,
+                                        node_tables[2][1],
+                                        node_tables[2][0],
+                                    ),
+                                )
+                            )
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_tmp2_b,
+                                        b1,
+                                        node_tables[2][3],
+                                        node_tables[2][2],
+                                    ),
+                                )
+                            )
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_tmp1_b,
+                                        b0,
+                                        v_tmp2_b,
+                                        v_tmp1_b,
+                                    ),
+                                )
+                            )
+                            node_val_src = v_tmp1_b
+                        else:
+                            b0 = parity_regs[(parity_slot - 2) % parity_depth]
+                            b1 = parity_regs[(parity_slot - 1) % parity_depth]
+                            b2 = parity_regs[(parity_slot - 1) % parity_depth]
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_tmp1_b,
+                                        b2,
+                                        node_tables[3][1],
+                                        node_tables[3][0],
+                                    ),
+                                )
+                            )
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_tmp2_b,
+                                        b2,
+                                        node_tables[3][3],
+                                        node_tables[3][2],
+                                    ),
+                                )
+                            )
+                            body.append(
+                                ("flow", ("vselect", v_tmp1_b, b1, v_tmp2_b, v_tmp1_b))
+                            )
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_tmp2_b,
+                                        b2,
+                                        node_tables[3][5],
+                                        node_tables[3][4],
+                                    ),
+                                )
+                            )
+                            body.append(
+                                (
+                                    "flow",
+                                    (
+                                        "vselect",
+                                        v_addr_b,
+                                        b2,
+                                        node_tables[3][7],
+                                        node_tables[3][6],
+                                    ),
+                                )
+                            )
+                            body.append(
+                                ("flow", ("vselect", v_tmp2_b, b1, v_addr_b, v_tmp2_b))
+                            )
+                            body.append(
+                                ("flow", ("vselect", v_tmp1_b, b0, v_tmp2_b, v_tmp1_b))
+                            )
+                            node_val_src = v_tmp1_b
+                    else:
+                        body.append(("valu", ("-", v_tmp1_b, v_idx_b, v_one)))
+                        body.append(("valu", ("+", v_addr_b, v_tmp1_b, v_forest_p)))
+                        for lane in range(VLEN):
+                            body.append(
+                                ("load", ("load_offset", v_tmp1_b, v_addr_b, lane))
+                            )
+                        node_val_src = v_tmp1_b
+
+                    body.append(("valu", ("^", v_val_b, v_val_b, node_val_src)))
+
+                    # Hash stages (vectorized)
+                    for op1, val1, op2, op3, val3 in HASH_STAGES:
+                        if op1 == "+" and op2 == "+" and op3 == "<<":
+                            mul = 1 + (1 << val3)
+                            body.append(
+                                (
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        v_val_b,
+                                        v_val_b,
+                                        vec_const[mul],
+                                        vec_const[val1],
+                                    ),
+                                )
+                            )
+                            continue
                         body.append(
                             (
                                 "valu",
-                                (
-                                    "multiply_add",
-                                    v_val_b,
-                                    v_val_b,
-                                    vec_const[mul],
-                                    vec_const[val1],
-                                ),
+                                (op1, v_tmp1_b, v_val_b, vec_const[val1]),
                             )
                         )
-                        continue
+                        body.append(
+                            (
+                                "valu",
+                                (op3, v_tmp2_b, v_val_b, vec_const[val3]),
+                            )
+                        )
+                        body.append(("valu", (op2, v_val_b, v_tmp1_b, v_tmp2_b)))
+
+                    parity_reg = parity_regs[parity_slot]
+                    body.append(("valu", ("&", parity_reg, v_val_b, v_one)))
                     body.append(
                         (
                             "valu",
-                            (op1, v_tmp1_b, v_val_b, vec_const[val1]),
+                            ("multiply_add", v_idx_b, v_idx_b, v_two, parity_reg),
                         )
                     )
-                    body.append(
-                        (
-                            "valu",
-                            (op3, v_tmp2_b, v_val_b, vec_const[val3]),
+                    if need_wrap:
+                        body.append(("valu", ("<", v_addr_b, v_idx_b, v_p_limit)))
+                        body.append(
+                            ("flow", ("vselect", v_idx_b, v_addr_b, v_idx_b, v_one))
                         )
-                    )
-                    body.append(("valu", (op2, v_val_b, v_tmp1_b, v_tmp2_b)))
+                        parity_slots[bi] = 0
+                    else:
+                        parity_slots[bi] = (parity_slot + 1) % parity_depth
 
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("valu", ("&", v_tmp1_b, v_val_b, v_one)))
-                body.append(("flow", ("vselect", v_tmp3_b, v_tmp1_b, v_two, v_one)))
-                body.append(("valu", ("*", v_tmp2_b, v_idx_b, v_two)))
-                body.append(("valu", ("+", v_idx_b, v_tmp2_b, v_tmp3_b)))
-
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("valu", ("<", v_cond_b, v_idx_b, v_n_nodes)))
-                body.append(("flow", ("vselect", v_idx_b, v_cond_b, v_idx_b, v_zero)))
-
-                body.append(("store", ("vstore", addr_idx_b, v_idx_b)))
+            for bi in range(active_bufs):
+                v_idx_b = v_idx[bi]
+                v_val_b = v_val[bi]
+                v_tmp1_b = v_tmp1[bi]
+                addr_idx_b = tmp_addr_vec[bi]
+                addr_val_b = tmp_addr2_vec[bi]
+                body.append(("valu", ("-", v_tmp1_b, v_idx_b, v_one)))
+                body.append(("store", ("vstore", addr_idx_b, v_tmp1_b)))
                 body.append(("store", ("vstore", addr_val_b, v_val_b)))
 
-            # Scalar tail for non-multiple of VLEN batch sizes.
+        for g in range(full_groups):
+            emit_group(g * group_size, n_bufs)
+        if rem_chunks:
+            emit_group(full_groups * group_size, rem_chunks)
+
+        # Scalar tail for non-multiple of VLEN batch sizes.
+        for round in range(rounds):
             for i in range(vec_batch, batch_size):
                 i_const = self.scratch_const(i)
                 # idx = mem[inp_indices_p + i]
